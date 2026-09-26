@@ -1,0 +1,10 @@
+# Applies only to builds whose context is the repo root (runner/Dockerfile).
+# java-bench/ and rust-bench/ are built with their own directory as context.
+*
+!CONTRACT.md
+!bench/
+!infra/
+!runner/
+bench/results/
+**/__pycache__/
+**/*.pyc
