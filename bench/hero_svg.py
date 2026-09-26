@@ -85,8 +85,8 @@ def render(data):
   <desc id="desc">Producer throughput of the Java Kafka client and rust-rdkafka as batch.size grows from 16 KB to 1 MB. Java peaks at 128 KB with {jv[3] / 1000:.2f}M msg/s and Rust at 1 MB with {rv[6] / 1000:.2f}M msg/s: each client peaks at a different batch.size.</desc>
   <defs>
     <style>
-      .sans {{ font-family: "Commissioner Variable", "Commissioner", system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }}
-      .mono {{ font-family: "Source Code Pro Variable", "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+      .sans {{ font-family: "Geist", system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }}
+      .mono {{ font-family: "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
       .axis {{ font-size: 18px; font-weight: 500; fill: {INK}; }}
       .halo {{ paint-order: stroke; stroke: {BG}; stroke-width: 7px; stroke-linejoin: round; }}
     </style>
