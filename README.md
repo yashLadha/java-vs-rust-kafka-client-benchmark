@@ -1,8 +1,90 @@
-# Kafka client benchmark: Java vs Rust
+# Java vs Rust Kafka clients: a benchmark
 
-Compares the Java client (`org.apache.kafka:kafka-clients` 4.3.1, Temurin 25) with the Rust client (`rdkafka` 0.39.0, bundling librdkafka 2.12.1) on the same hardware, against a single Kafka 4.3.1 broker. Everything runs in Docker on the Docker host of the active context (an EC2 c6i.8xlarge in the reference runs). The local machine is only a `docker` CLI client.
+![Java and Rust producer throughput against batch.size: Java peaks at 128 KB, Rust at 1 MB](docs/images/hero.svg)
 
-`CONTRACT.md` is the fairness specification both harnesses implement: payload generation, partitioning, config mapping, measurement windows, and the result schema.
+This repository benchmarks the Java Kafka client (`org.apache.kafka:kafka-clients` 4.3.1, Temurin 25) against the Rust client (`rdkafka` 0.39.0, bundling librdkafka 2.12.1). Both run on the same hardware, against the same single Kafka 4.3.1 broker, with byte-identical payloads. Everything runs in Docker on the Docker host of the active context (an EC2 c6i.8xlarge in the reference runs). The local machine is only a `docker` CLI client.
+
+- The story, with every step: [Java vs Rust Kafka Clients: Chasing Down the Gaps](https://yashladha.in/blog/java-vs-rust-kafka-client-performance/)
+- The full analysis: [`docs/ANALYSIS.md`](docs/ANALYSIS.md), with the diagnoses in [`docs/diagnosis.md`](docs/diagnosis.md) (Rust) and [`docs/java-diagnosis.md`](docs/java-diagnosis.md) (Java)
+- The fairness specification both harnesses implement: [`CONTRACT.md`](CONTRACT.md)
+
+## Results at a glance
+
+Each client tuned, 1 KB messages, 6 partitions, one client instance, medians of 3 reps unless noted.
+
+| | Java | Rust |
+|---|---|---|
+| Producer, each client at its best `batch.size` | 1.05M msg/s (1.12M with `send.buffer.bytes=-1`, single run) | 1.00M msg/s |
+| Producer, each client at its library defaults | 561k msg/s | 1.00M msg/s |
+| Consumer, 1 KB | 1.21M msg/s | 1.35M msg/s |
+| Consumer, 10 KB | 137k msg/s | 305k msg/s |
+| Consumer, 100 B | 5.75M msg/s | 2.10M msg/s |
+| End-to-end p99, 1k msg/s, `linger.ms=0` | 0.39 ms | 0.20 ms |
+| End-to-end p99, 50k msg/s, `linger.ms=0` | 0.93 ms | 1.93 ms with `max.in.flight=5`, 32.9 ms with librdkafka defaults |
+| Peak RSS | about 2.4 GB (pre-touched 2 GiB heap) | 9 MB to 1.2 GB |
+| Startup to ready | 260 ms | 0.8 ms |
+
+Rust consumer numbers use the tuned consumer (`rust-tuned`: batch API and `fetch.queue.backoff.ms=10`).
+
+## The story in charts
+
+### The test bench
+
+Broker, orchestrator and clients run in separate containers pinned to separate cores of one host.
+
+![Test bench: broker, runner and client containers pinned to separate cores on one EC2 host](docs/images/01-testbench.svg)
+
+### First run: Rust behind almost everywhere
+
+With every setting mapped one to one to Java's, Rust trailed in most scenarios: 0.43x on the producer baseline and 0.06x on 100 B consumption, but 2.14x on 10 KB consumption.
+
+![Rust to Java throughput ratio for every single-instance scenario in the first run](docs/images/02-first-run-ratios.svg)
+
+### Gap 1: the Rust producer is bound by bytes per request
+
+librdkafka puts one partition's batch in each ProduceRequest, and the broker serves one connection's requests in order. At Java's 16 KB `batch.size` that caps Rust at about 245k msg/s. librdkafka's own default is 1 MB, where Rust reaches about 1M msg/s.
+
+![Producer throughput against batch.size for both clients](docs/images/05-batch-size-sweep.svg)
+
+### Gap 2: the Rust consumer pauses for a second
+
+When a partition's local queue fills, librdkafka stops fetching it for `fetch.queue.backoff.ms`, 1000 ms by default. At 100 B that queue fills in milliseconds. A 10 ms backoff and the batch API take Rust from 389k to 2.02M msg/s.
+
+![Rust consumer at 100 B: 389k with defaults, 1.48M with a 10 ms backoff, 2.02M with the batch API, against Java's 5.61M](docs/images/07-consumer-100b-steps.svg)
+
+### The rerun: where the gaps went
+
+![Rust to Java ratio in the first run and after the fixes, for producer and consumer scenarios](docs/images/09-before-after.svg)
+
+### Gap 3: the Java side
+
+Java's slow spots had causes of their own. Its fixed 128 KB socket send buffer makes large requests expensive, because the JDK re-copies the unsent part of a heap buffer on every partial write; `send.buffer.bytes=-1` lifts the 1 MB point from 630k to 875k msg/s.
+
+![Java producer throughput against batch.size with default and OS-sized socket buffers, with Rust for reference](docs/images/15-java-batch-sweep.svg)
+
+A single `KafkaConsumer` does all socket reads, parsing and copying on the polling thread, which runs at about one core. `receive.buffer.bytes=-1` adds 16 to 17%.
+
+![Java consumer throughput with default and OS-sized receive buffers, against Rust](docs/images/16-java-consumer.svg)
+
+With 16 producer instances in one JVM, queued records fill the 2 GB heap and GC collapses. Capping `buffer.memory` recovers most of the throughput.
+
+![Java producer at 16 instances: default, 8 GB heap, and capped buffer.memory](docs/images/17-java-k16.svg)
+
+### Latency: one knob matters
+
+librdkafka's default `max.in.flight` of 1,000,000 costs about 20x at p99 when `linger.ms=0` and the rate is high. Setting it to 5 brings Rust back next to Java.
+
+![Rust producer send-to-ack latency at 50k msg/s and linger.ms 0 for three configurations](docs/images/14-inflight-latency.svg)
+
+![End-to-end p99 latency for Java, Rust, the tuned consumer and max.in.flight 5, at linger.ms 0 and 5](docs/images/19-e2e-rerun.svg)
+
+### Scaling and cost
+
+![Throughput against the number of client instances in one process](docs/images/10-scaling.svg)
+
+![CPU per million messages and peak memory for both clients](docs/images/12-resources.svg)
+
+All charts are in [`docs/images/`](docs/images/) and are generated by `bench/story_plots.py` and `bench/hero_svg.py` (see [Charts for the write-up](#charts-for-the-write-up)).
 
 ## Layout
 
@@ -12,7 +94,7 @@ Compares the Java client (`org.apache.kafka:kafka-clients` 4.3.1, Temurin 25) wi
 | `rust-bench/` | Rust harness, image `kbench-rust:latest` |
 | `infra/` | Broker compose file (`kbench-kafka` on `kbench-net`), topic, broker-stats, host-info and stock perf-test scripts |
 | `bench/` | Orchestrator (`run.py`), scenario matrix (`matrix.py`), report generator (`report.py`), fake-data generator (`fake.py`), write-up charts (`story_plots.py`, `hero_svg.py`) |
-| `docs/` | Diagnosis write-ups (`diagnosis.md`) |
+| `docs/` | Full analysis (`ANALYSIS.md`), Rust and Java diagnoses (`diagnosis.md`, `java-diagnosis.md`), charts (`images/`) |
 | `runner/` | Image `kbench-runner:latest` that runs the orchestrator and report on the Docker host |
 | `kbench.sh` | Launcher; uses only `docker` commands |
 
